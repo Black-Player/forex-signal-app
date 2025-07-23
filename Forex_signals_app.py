@@ -1,104 +1,102 @@
 import streamlit as st
 import pandas as pd
-import numpy as np
-import ta
 import json
 import websocket
+import ta
 import threading
-import time
 
 st.set_page_config(page_title="Deriv Signal Generator", layout="centered")
-st.title("📈 Deriv Synthetic Index Signal Generator")
+st.title("📈 Deriv Signal Generator (Live Data)")
 
-# User Input
-symbol = st.selectbox("Choose Instrument", [
-    "R_100", "R_75", "R_50", "R_25", "R_10", "Boom_1000_Index", "Crash_1000_Index", "Volatility_75_Index"
-])
-granularity = st.selectbox("Timeframe", {"1m": 60, "5m": 300, "1h": 3600})
-candles_limit = st.slider("Candles to Fetch", 50, 500, 100)
-
-# Global data holder
-candles = []
-
-# Mapping
-symbol_map = {
-    "Volatility_75_Index": "R_75",
-    "Boom_1000_Index": "boom_1000_index",
-    "Crash_1000_Index": "crash_1000_index",
-    "R_100": "R_100",
-    "R_75": "R_75",
-    "R_50": "R_50",
-    "R_25": "R_25",
-    "R_10": "R_10"
+# === User Inputs ===
+symbols = {
+    "Volatility 75 Index": "volatility_75_index",
+    "Boom 1000 Index": "boom_1000_index",
+    "Crash 1000 Index": "crash_1000_index"
 }
 
-deriv_symbol = symbol_map[symbol]
+symbol_name = st.selectbox("Select Instrument", list(symbols.keys()))
+symbol = symbols[symbol_name]
 
-# Function to run websocket
+granularities = {
+    "1 Minute": 60,
+    "5 Minutes": 300,
+    "1 Hour": 3600
+}
+gran_label = st.selectbox("Select Timeframe", list(granularities.keys()))
+granularity = granularities[gran_label]
+
+count = st.slider("Number of Candles", 50, 500, 100)
+
+# === Global candle holder ===
+candles_data = []
+
 def fetch_candles():
-    global candles
-    ws = websocket.WebSocket()
+    global candles_data
     try:
+        ws = websocket.WebSocket()
         ws.connect("wss://ws.binaryws.com/websockets/v3?app_id=1089")
-        request = {
-            "ticks_history": deriv_symbol,
-            "adjust_start_time": 1,
-            "count": candles_limit,
-            "end": "latest",
-            "start": 1,
-            "style": "candles",
-            "granularity": granularity
-        }
-        ws.send(json.dumps(request))
-        result = json.loads(ws.recv())
-        if "candles" in result:
-            candles = result["candles"]
-    except Exception as e:
-        st.error(f"WebSocket error: {e}")
-    finally:
-        ws.close()
 
-# Run in thread so Streamlit doesn't freeze
+        request = {
+            "ticks_history": symbol,
+            "style": "candles",
+            "granularity": granularity,
+            "count": count,
+            "end": "latest"
+        }
+
+        ws.send(json.dumps(request))
+
+        while True:
+            msg = json.loads(ws.recv())
+            if "candles" in msg:
+                candles_data = msg["candles"]
+                break
+            elif "error" in msg:
+                st.error(f"❌ API Error: {msg['error']['message']}")
+                break
+
+        ws.close()
+    except Exception as e:
+        st.error(f"WebSocket Error: {e}")
+
+# === Run fetch in thread ===
 thread = threading.Thread(target=fetch_candles)
 thread.start()
 thread.join()
 
-# Build DataFrame
-if not candles:
-    st.error("❌ Failed to fetch candles from Deriv.")
+# === Process Candles ===
+if not candles_data:
+    st.error("❌ Failed to fetch candles. Try changing symbol or timeframe.")
 else:
-    df = pd.DataFrame(candles)
-    df['time'] = pd.to_datetime(df['epoch'], unit='s')
+    df = pd.DataFrame(candles_data)
+    df["time"] = pd.to_datetime(df["epoch"], unit="s")
     df.set_index("time", inplace=True)
     df = df[["open", "high", "low", "close"]].astype(float)
 
-    if len(df) > 50:
-        try:
-            df["RSI"] = ta.momentum.RSIIndicator(df["close"]).rsi()
-            df["SMA_20"] = ta.trend.SMAIndicator(df["close"], window=20).sma_indicator()
-            df["SMA_50"] = ta.trend.SMAIndicator(df["close"], window=50).sma_indicator()
+    # === Calculate Indicators ===
+    try:
+        df["RSI"] = ta.momentum.RSIIndicator(df["close"]).rsi()
+        df["SMA_20"] = ta.trend.SMAIndicator(df["close"], window=20).sma_indicator()
+        df["SMA_50"] = ta.trend.SMAIndicator(df["close"], window=50).sma_indicator()
 
-            last = df.iloc[-1]
-            signal = "🔍 Neutral"
-            reason = "Conditions not met for strong signal."
+        last = df.iloc[-1]
+        signal = "🔍 Neutral"
+        reason = "No strong signal."
 
-            if last["RSI"] < 30 and last["SMA_20"] > last["SMA_50"]:
-                signal = "🟢 Buy"
-                reason = "RSI oversold and short-term trend above long-term."
-            elif last["RSI"] > 70 and last["SMA_20"] < last["SMA_50"]:
-                signal = "🔴 Sell"
-                reason = "RSI overbought and short-term trend below long-term."
+        if last["RSI"] < 30 and last["SMA_20"] > last["SMA_50"]:
+            signal = "🟢 Buy"
+            reason = "RSI oversold and SMA 20 > SMA 50."
+        elif last["RSI"] > 70 and last["SMA_20"] < last["SMA_50"]:
+            signal = "🔴 Sell"
+            reason = "RSI overbought and SMA 20 < SMA 50."
 
-            st.subheader(f"Signal for {symbol} on {granularity} chart")
-            st.metric("Trading Signal", signal)
-            st.caption(reason)
+        st.metric("Signal", signal)
+        st.caption(reason)
+        st.line_chart(df[["close", "SMA_20", "SMA_50"]].dropna())
 
-            st.line_chart(df[["close", "SMA_20", "SMA_50"]].dropna())
+        with st.expander("📊 Show Data"):
+            st.dataframe(df.tail(10))
 
-            with st.expander("🔎 View Latest Candle Data"):
-                st.dataframe(df.tail(10))
-
-        except Exception as e:
-            st.error(f"⚠️ Error calculating indicators: {e}")
-    else:
-        st.warning("Not enough candle data to calculate signals.")
+    except Exception as e:
+        st.error(f"⚠️ Indicator calculation error: {e}")
