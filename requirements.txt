@@ -1,4 +1,4 @@
 streamlit
-ta
 pandas
+ta
 websocket-client
