@@ -1,75 +1,104 @@
-import yfinance as yf
-import pandas as pd
 import streamlit as st
+import pandas as pd
+import numpy as np
 import ta
+import json
+import websocket
+import threading
+import time
 
-st.set_page_config(page_title="Forex Signal Generator", layout="centered")
+st.set_page_config(page_title="Deriv Signal Generator", layout="centered")
+st.title("📈 Deriv Synthetic Index Signal Generator")
 
-st.title("📈 Forex Signal Generator")
-st.markdown("Select a Forex pair and timeframe to generate simple buy/sell signals.")
+# User Input
+symbol = st.selectbox("Choose Instrument", [
+    "R_100", "R_75", "R_50", "R_25", "R_10", "Boom_1000_Index", "Crash_1000_Index", "Volatility_75_Index"
+])
+granularity = st.selectbox("Timeframe", {"1m": 60, "5m": 300, "1h": 3600})
+candles_limit = st.slider("Candles to Fetch", 50, 500, 100)
 
-# --- User input
-pair = st.selectbox("Select Forex Pair", ["EURUSD=X", "GBPUSD=X", "USDJPY=X", "AUDUSD=X", "XAUUSD=X"])
-timeframe = st.selectbox("Select Timeframe", ["1d", "1h", "15m"])
-period = st.slider("Lookback Period (days)", 5, 100, 30)
+# Global data holder
+candles = []
 
-# --- Interval mapping for Yahoo
-interval_map = {"1d": "1d", "1h": "60m", "15m": "15m"}
+# Mapping
+symbol_map = {
+    "Volatility_75_Index": "R_75",
+    "Boom_1000_Index": "boom_1000_index",
+    "Crash_1000_Index": "crash_1000_index",
+    "R_100": "R_100",
+    "R_75": "R_75",
+    "R_50": "R_50",
+    "R_25": "R_25",
+    "R_10": "R_10"
+}
 
-@st.cache_data
-def get_data(pair, period, interval):
+deriv_symbol = symbol_map[symbol]
+
+# Function to run websocket
+def fetch_candles():
+    global candles
+    ws = websocket.WebSocket()
     try:
-        data = yf.download(tickers=pair, period=f"{period}d", interval=interval)
-        return data
+        ws.connect("wss://ws.binaryws.com/websockets/v3?app_id=1089")
+        request = {
+            "ticks_history": deriv_symbol,
+            "adjust_start_time": 1,
+            "count": candles_limit,
+            "end": "latest",
+            "start": 1,
+            "style": "candles",
+            "granularity": granularity
+        }
+        ws.send(json.dumps(request))
+        result = json.loads(ws.recv())
+        if "candles" in result:
+            candles = result["candles"]
     except Exception as e:
-        st.error(f"Data download failed: {e}")
-        return pd.DataFrame()
+        st.error(f"WebSocket error: {e}")
+    finally:
+        ws.close()
 
-# --- Load data
-df = get_data(pair, period, interval_map[timeframe])
+# Run in thread so Streamlit doesn't freeze
+thread = threading.Thread(target=fetch_candles)
+thread.start()
+thread.join()
 
-# --- Validate data
-if df.empty:
-    st.error("⚠️ No data returned. Try changing the pair or timeframe.")
-elif "Close" not in df.columns:
-    st.error("⚠️ 'Close' column is missing from the data.")
-elif df["Close"].isnull().sum() > 0:
-    st.error("⚠️ Missing 'Close' price values. Try a different pair or period.")
+# Build DataFrame
+if not candles:
+    st.error("❌ Failed to fetch candles from Deriv.")
 else:
-    df.dropna(subset=["Close"], inplace=True)
+    df = pd.DataFrame(candles)
+    df['time'] = pd.to_datetime(df['epoch'], unit='s')
+    df.set_index("time", inplace=True)
+    df = df[["open", "high", "low", "close"]].astype(float)
 
-    if len(df) < 60:
-        st.warning("⚠️ Not enough data to calculate indicators. Try a longer period.")
-    else:
+    if len(df) > 50:
         try:
-            # --- Indicators
-            df["RSI"] = ta.momentum.RSIIndicator(df["Close"]).rsi()
-            df["SMA_20"] = ta.trend.SMAIndicator(df["Close"], window=20).sma_indicator()
-            df["SMA_50"] = ta.trend.SMAIndicator(df["Close"], window=50).sma_indicator()
+            df["RSI"] = ta.momentum.RSIIndicator(df["close"]).rsi()
+            df["SMA_20"] = ta.trend.SMAIndicator(df["close"], window=20).sma_indicator()
+            df["SMA_50"] = ta.trend.SMAIndicator(df["close"], window=50).sma_indicator()
 
-            # --- Signal logic
             last = df.iloc[-1]
             signal = "🔍 Neutral"
-            explanation = "Conditions are not strong enough for a Buy or Sell signal."
+            reason = "Conditions not met for strong signal."
 
             if last["RSI"] < 30 and last["SMA_20"] > last["SMA_50"]:
                 signal = "🟢 Buy"
-                explanation = "RSI indicates oversold and short-term trend is above long-term trend."
+                reason = "RSI oversold and short-term trend above long-term."
             elif last["RSI"] > 70 and last["SMA_20"] < last["SMA_50"]:
                 signal = "🔴 Sell"
-                explanation = "RSI indicates overbought and short-term trend is below long-term trend."
+                reason = "RSI overbought and short-term trend below long-term."
 
-            # --- Display
-            st.subheader(f"Signal for {pair} on {timeframe.upper()}")
-            st.metric(label="Trading Signal", value=signal)
-            st.caption(explanation)
+            st.subheader(f"Signal for {symbol} on {granularity} chart")
+            st.metric("Trading Signal", signal)
+            st.caption(reason)
 
-            # --- Chart
-            st.line_chart(df[["Close", "SMA_20", "SMA_50"]].dropna())
+            st.line_chart(df[["close", "SMA_20", "SMA_50"]].dropna())
 
-            # --- Data Preview
-            with st.expander("🔎 View raw price data"):
-                st.dataframe(df.tail(15))
+            with st.expander("🔎 View Latest Candle Data"):
+                st.dataframe(df.tail(10))
 
         except Exception as e:
             st.error(f"⚠️ Error calculating indicators: {e}")
+    else:
+        st.warning("Not enough candle data to calculate signals.")
